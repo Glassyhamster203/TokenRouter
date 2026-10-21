@@ -19,12 +19,14 @@
 - **单端口接入**：所有下游 key 都通过 `http://127.0.0.1:8787/v1` 连接；管理操作走本地 CLI，不额外监听端口。
 - **真实上游 key 不落盘**：上游 key 只从环境变量读取；配置文件可安全提交到 Git。
 - **虚拟 key**：随机生成、只在创建时显示一次，数据库只保存 SHA-256 哈希和前 12 位前缀。
-- **请求级计费**：记录每个请求的模型、端点、输入/输出 token、费用、延迟、状态和是否估算。
+- **请求级计费**：记录每个请求的模型、端点、输入/缓存命中/输出 token、费用、延迟、状态和是否估算。
+- **模型级价格**：支持全局模型价和按 key 覆盖价，分别设置输入、输出、缓存命中（每百万 token）单价；未匹配时回退到 key 默认价。
 - **日/月双重限额**：每个 key 可独立设置每日、每月 token 限额和费用限额；两类限额可同时生效。
 - **并发安全预占**：转发前预占 token/费用预算，避免多个并发请求同时穿过配额。429 响应带 `Retry-After`。
 - **流式支持**：原样转发 SSE，同时从流中提取 `usage`；对 OpenAI chat/completions 自动注入 `stream_options.include_usage=true`。
 - **精确优先、估算兜底**：优先使用上游返回的 usage；没有 usage 时用无分词器的保守估算，并在账本中标记 `estimated=1`。
 - **零第三方依赖**：只使用 Python 标准库（`http.server`、`http.client`、`sqlite3`、`ssl` 等）；测试使用 `unittest`。
+- **Linux 一键部署**：自带 `deploy.sh`，自动创建系统用户、安装代码、生成配置和 systemd 服务，并以 0600 权限保存上游 key。
 - **本地优先安全默认**：默认只绑定 `127.0.0.1`；非回环绑定会打印警告。
 
 ## 快速开始
@@ -73,8 +75,24 @@ set TOKEN_ROUTER_UPSTREAM_KEY=sk-你的真实上游key
 
 - `--daily-tokens` / `--monthly-tokens` 支持 `100k`、`1.5m`、`2b`，`none` 表示不限。
 - `--daily-cost` / `--monthly-cost` 的单位由 `config.json` 的 `currency` 决定；`none` 表示不限。
-- `--price-in` / `--price-out` 表示**每 100 万 token** 的价格；不填则使用配置中的默认价。
+- `--price-in` / `--price-out` 是**key 默认**的每 100 万 token 价格，作为未配置模型价时的回退价。
 - 明文 key 只显示一次，请立即保存。
+
+按模型设置更精确的价格（可分别设置缓存命中价）：
+
+```powershell
+# 全局模型价，适用于所有 key
+.\run.cmd price set --model gpt-4o-mini --input 0.15 --output 0.60 --cached 0.075
+
+# 仅覆盖 key #1 的该模型价格
+.\run.cmd price set --key 1 --model gpt-4o-mini --input 0.20 --output 0.80 --cached 0.10
+
+# 查看价格
+.\run.cmd price list
+.\run.cmd price list --key 1
+```
+
+价格优先级：**key 模型覆盖价 > 全局模型价 > key 默认输入/输出价**。缓存命中价未设置时，默认等于输入价。
 
 ### 4. 启动网关
 
@@ -127,6 +145,59 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"你好"}]}'
 ```
 
+## Linux 一键部署（systemd）
+
+仓库根目录的 [deploy.sh](deploy.sh) 面向 systemd Linux，要求 root/sudo、Python 3.10+ 和 systemd。它不需要 pip、虚拟环境或任何第三方 Python 包。
+
+```bash
+cd /path/to/TokenRouter
+chmod +x deploy.sh
+sudo ./deploy.sh --upstream-base-url https://api.openai.com/v1 --port 8787
+```
+
+脚本会：
+
+1. 检查 Python 版本和 systemd；
+2. 创建系统用户/组 `token-router`；
+3. 将 `token_router/` 安装到 `/opt/token-router`；
+4. 生成 `/etc/token-router/config.json`（不含 key）；
+5. 安全提示输入上游 key，写入 `/etc/token-router/token-router.env`，权限 `0600`；
+6. 初始化/迁移 `/var/lib/token-router/router.db`；
+7. 创建并启动 `token-router.service`，带 `ProtectSystem=strict`、`NoNewPrivileges` 等 systemd 加固；
+8. 首次安装时创建名为 `default` 的下游 key，并只在终端显示一次；
+9. 安装管理命令 `/usr/local/bin/token-router-admin`。
+
+常用参数：
+
+```bash
+sudo ./deploy.sh --help
+sudo ./deploy.sh --host 127.0.0.1 --port 8787 --no-key
+sudo ./deploy.sh --service-name token-router --data-dir /var/lib/token-router
+```
+
+安装完成后：
+
+```bash
+# 管理命令必须以 root 运行，内部会切换为服务用户，避免 SQLite 文件属主错乱
+sudo token-router-admin status
+sudo token-router-admin usage
+sudo token-router-admin requests --limit 20
+sudo token-router-admin key list
+
+# 配置价格与限额
+sudo token-router-admin key update 1 --price-in 0.50 --price-out 1.50 --daily-tokens 2m
+sudo token-router-admin price set --model gpt-4o-mini --input 0.15 --output 0.60 --cached 0.075
+
+# 服务管理
+sudo systemctl status token-router
+sudo journalctl -u token-router -f
+```
+
+- 脚本可重复执行用于升级：保留现有配置、上游 key 和数据库；`--force-config` 会重新生成配置。
+- 如果已有 `TOKEN_ROUTER_UPSTREAM_KEY` 环境变量，可非交互传入；否则脚本会安全提示输入。
+- 默认只监听 `127.0.0.1`。绑定 `0.0.0.0` 前请在前面放 TLS 反向代理和防火墙，因为网关本身不终止 TLS。
+- 卸载：先备份数据，然后 `systemctl disable --now token-router`，删除服务单元、`/usr/local/bin/token-router-admin`、`/opt/token-router`，并按需删除 `/etc/token-router` 与 `/var/lib/token-router`。
+
 ## 支持的端点
 
 | 方法 | 路径 | 是否计费 | 说明 |
@@ -171,6 +242,8 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
 | `log_level` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
 
 环境变量覆盖：`TR_CONFIG`、`TR_HOST`、`TR_PORT`、`TR_DATA_DIR`、`TR_UPSTREAM_BASE_URL`、`TR_TIMEZONE_OFFSET_MINUTES`、`TR_LOG_LEVEL`、`TR_UPSTREAM_API_KEY`。
+
+模型级价格不放在 `config.json`，而是保存在 SQLite 的 `model_prices` 表中，通过 `price set/list/remove` 管理，修改后立即生效。
 
 ### 上游地址映射
 
@@ -220,10 +293,39 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
 
 `key` 参数可以使用数字 ID 或 key 前缀。前缀匹配多个 key 时会要求改用 ID。
 
+### 模型价格
+
+模型价格支持三级回退：
+
+```text
+key 的模型覆盖价 → 全局模型价 → key 默认输入/输出价
+```
+
+```powershell
+# 全局价格：所有 key 的该模型默认使用此价格
+.\run.cmd price set --model gpt-4o-mini --input 0.15 --output 0.60 --cached 0.075
+
+# 指定 key 的覆盖价：优先级高于全局价
+.\run.cmd price set --key 1 --model gpt-4o-mini --input 0.20 --output 0.80 --cached 0.10
+
+# 不写 --cached 时，缓存命中价默认等于该模型的输入价
+.\run.cmd price set --model gpt-4o --input 2.50 --output 10 --cached 1.25
+
+# 查看全局价；带 --key 时同时查看该 key 的覆盖价
+.\run.cmd price list
+.\run.cmd price list --key 1
+
+# 删除覆盖价/全局价
+.\run.cmd price remove --key 1 --model gpt-4o-mini --yes
+.\run.cmd price remove --model gpt-4o-mini --yes
+```
+
+模型名必须与下游请求中的 `model` 字段**精确匹配**（不区分前后空格，但不支持通配符）。未匹配到模型价时使用 key 的默认价格，缓存命中部分也按输入价计费。
+
 ### 查看用量与账本
 
 ```powershell
-# 今日/本月按 key 汇总，含限额与剩余 token
+# 今日/本月按 key 汇总，含缓存命中、限额与剩余 token
 .\run.cmd usage
 
 # 只看某个 key；包含已吊销 key 需加 --all
@@ -252,35 +354,56 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
 
 ## 计费模型
 
-每个 key 有两个价格：
+价格按每 **100 万 token** 配置，分为三个维度：
 
-- `price_in_micros_per_mtok`：输入 token 每 100 万 token 的价格；
-- `price_out_micros_per_mtok`：输出 token 每 100 万 token 的价格。
+- 输入价 `input`：普通输入 token；
+- 输出价 `output`：输出 token；
+- 缓存命中价 `cached`：输入 token 中命中上游 prompt cache 的部分，未配置时默认等于输入价。
+
+价格来源优先级：
+
+```text
+key 的模型覆盖价 > 全局模型价 > key 默认输入/输出价
+```
+
+key 的默认价格在 `key create/update --price-in/--price-out` 设置；模型价格通过 `price set` 设置。
 
 内部金额使用**整数微单位**（`1 单位 = 1,000,000 微单位`），避免浮点误差。单次请求费用向上取整到 1 微单位：
 
 ```text
-cost = ceil((input_tokens × price_in + output_tokens × price_out) / 1_000_000)
+uncached = max(0, input_tokens - cached_input_tokens)
+cost = ceil(
+  (uncached × input_price
+   + cached_input_tokens × cached_price
+   + output_tokens × output_price) / 1_000_000
+)
 ```
 
-例如输入 10 token、输出 5 token，输入价 `$1/M`、输出价 `$2/M`：
+例如输入 100 token，其中 60 token 命中缓存，输出 10 token；输入价 `$2/M`、缓存价 `$0.5/M`、输出价 `$10/M`：
 
 ```text
-(10×1,000,000 + 5×2,000,000) / 1,000,000 = 20 微单位 = $0.00002
+40 × $2/M + 60 × $0.5/M + 10 × $10/M
+= $0.00008 + $0.00003 + $0.0001
+= $0.00021（210 微单位）
 ```
 
 计费规则：
 
 1. 仅上游返回 **2xx** 时计费；上游 4xx/5xx、网络异常、配额拒绝均不计费。
-2. 有 `usage` 时以 `prompt_tokens`/`completion_tokens` 或 Responses API 的 `input_tokens`/`output_tokens` 为准，`estimated=0`。
+2. 有 `usage` 时以 provider 返回的 token 为准，`estimated=0`：
+   - chat/completions：`prompt_tokens`、`completion_tokens`；
+   - Responses API：`input_tokens`、`output_tokens`；
+   - 缓存命中：`prompt_tokens_details.cached_tokens`、`input_tokens_details.cached_tokens`、DeepSeek 的 `prompt_cache_hit_tokens`，以及 `cache_read_input_tokens` 兼容字段。
 3. 无 usage 时使用本地估算，`estimated=1`：
    - 输入：遍历 messages / prompt / input / tools 等文本做估算；图片按固定额度近似；
    - 输出：从非流式响应文本或 SSE delta 文本估算；
+   - 估算模式下无法知道缓存命中，缓存 token 记为 0，全部输入按普通输入价计费；
    - 流式客户端中途断开时，按已收到的部分估算。
 4. `/v1/models` 和 `/health` 不计费；模型查询仍会在请求账本中留下状态记录。
-5. 费用限额基于计算出的费用；token 限额基于输入 token + 输出 token。
+5. token 限额按**总输入 + 输出**计算（缓存命中 token 也是输入 token 的一部分）；费用限额按上面公式计算出的费用。
+6. 请求账本保存 `input_tokens`、`cached_input_tokens`、`output_tokens`、`cost_micros`；日/月汇总也保存缓存命中量。
 
-> 本地估算是为了在兼容性较差的上游上仍能收费和限流，不是精确 tokenizer。对账要求高时，应优先让上游返回 usage。
+> 缓存命中 token 必须由上游 usage 提供；如果上游不返回缓存字段，路由器不会猜测，按普通输入计费。本地估算是为了在兼容性较差的上游上仍能收费和限流，不是精确 tokenizer。
 
 ## 配额与并发语义
 
@@ -296,8 +419,10 @@ cost = ceil((input_tokens × price_in + output_tokens × price_out) / 1_000_000)
 ```text
 预占 token = 估算输入 token + 请求的 max_tokens/max_completion_tokens/max_output_tokens
                             （未指定时用 default_max_output_tokens）
-预占费用 = 按预占 token 和该 key 的价格计算
+预占费用 = 按解析出的模型价格计算；输入预占使用 max(输入价, 缓存命中价)
 ```
+
+预占时还不知道缓存命中比例，因此输入部分按“输入价/缓存价较高者”保守计算；结算时再按实际 usage 的缓存 token 精确计费。
 
 检查同时覆盖“已落账用量 + 当前在途预占 + 本次预占”。因此并发请求不会一起穿透配额。预算不足时直接返回 `429`：
 
@@ -353,13 +478,15 @@ cost = ceil((input_tokens × price_in + output_tokens × price_out) / 1_000_000)
 
 - 数据库：`data/router.db`（首次运行创建），SQLite WAL 模式。
 - 表：
-  - `api_keys`：虚拟 key 哈希、前缀、价格、限额、状态；
-  - `usage_buckets`：按 key + 日/月 + 周期起点聚合的 token/费用；
-  - `request_log`：请求级明细，可用 `prune` 清理。
+  - `api_keys`：虚拟 key 哈希、前缀、默认价格、限额、状态；
+  - `model_prices`：全局模型价和按 key 覆盖价（`key_id` 为 NULL 表示全局）；
+  - `usage_buckets`：按 key + 日/月 + 周期起点聚合的输入/缓存/输出 token、请求数和费用；
+  - `request_log`：请求级明细（含缓存命中 token），可用 `prune` 清理。
+- 数据库 schema 版本为 2；从 v1 启动时会自动补充缓存列和 `model_prices` 表，不丢失历史数据。
 - 上游 key 只存在环境变量中；`config.json` 不含真实 key。
 - 下游明文 key 只在创建/轮换时输出一次；数据库只有 SHA-256 哈希。
 - 默认绑定回环地址。绑定 `0.0.0.0` 会打印警告；本机端口没有 TLS，不建议直接暴露到局域网/公网。需要远程访问时，建议在前面加带 TLS 的反向代理和防火墙。
-- 请求日志不保存 prompt/response 正文，但会保存模型、端点、token、费用、延迟、客户端 IP 和错误摘要；请保护 `data/` 目录并按需 `prune`。
+- 请求日志不保存 prompt/response 正文，但会保存模型、端点、输入/缓存/输出 token、费用、延迟、客户端 IP 和错误摘要；请保护 `data/` 目录并按需 `prune`。
 - 没有内置 RPM/TPM 限速，只有日/月配额；需要更细的速率限制时可在反向代理层实现。
 - 本项目不提供预付费钱包/实际扣款；“计费”指按 token 计算费用、记录账本并执行费用限额。若需要余额扣减，可在 `usage_buckets`/`request_log` 上扩展。
 
@@ -379,7 +506,7 @@ cost = ceil((input_tokens × price_in + output_tokens × price_out) / 1_000_000)
 .\run.cmd prune --days 90 --yes
 ```
 
-日志输出到启动终端，默认 `INFO` 级别，一行一个请求，包含请求 ID、key 名称、端点、状态、输入/输出 token、费用、是否估算、延迟和客户端 IP；不记录 key 明文和请求正文。
+日志输出到启动终端，默认 `INFO` 级别，一行一个请求，包含请求 ID、key 名称、端点、状态、输入/缓存/输出 token、费用、是否估算、延迟和客户端 IP；不记录 key 明文和请求正文。
 
 备份时建议停服后复制 `data/` 下全部文件，或使用 SQLite 官方 `.backup` 命令做在线备份。修改上游 key 后重启 `serve` 即可。
 
@@ -388,16 +515,17 @@ cost = ceil((input_tokens × price_in + output_tokens × price_out) / 1_000_000)
 ```text
 TokenRouter/
 ├─ config.json               # 可提交的配置（不含上游 key）
-├─ run.cmd                   # 使用指定 Python 环境的启动器
+├─ run.cmd                   # Windows 下使用指定 Python 环境的启动器
+├─ deploy.sh                 # Linux systemd 一键部署/升级脚本
 ├─ token_router/
 │  ├─ __main__.py            # python -m token_router
-│  ├─ cli.py                 # init/serve/key/usage/requests/prune 等
+│  ├─ cli.py                 # init/serve/key/price/usage/requests/prune 等
 │  ├─ config.py              # 配置加载、环境覆盖、校验
-│  ├─ db.py                  # SQLite schema、key、用量桶、请求账本
+│  ├─ db.py                  # SQLite schema、key、模型价格、用量桶、请求账本
 │  ├─ quota.py               # 并发预占、配额检查、结算
 │  ├─ proxy.py               # 单端口 HTTP/SSE 代理与鉴权
 │  ├─ upstream.py            # 上游 HTTP 客户端与 keep-alive 连接池
-│  ├─ usage.py               # usage 提取、注入、SSE 解析、token 估算
+│  ├─ usage.py               # usage/缓存字段提取、注入、SSE 解析、token 估算
 │  └─ util.py                # 金额/周期/表格等工具
 └─ tests/                    # unittest 单元与集成测试
 ```
@@ -412,23 +540,28 @@ cd E:\TokenRouter
 测试不依赖 pytest 或任何第三方包，覆盖：
 
 - 配额预占、并发超限、结算释放；
-- 日/月用量桶、请求账本、清理；
+- 日/月用量桶、缓存 token、请求账本、清理；
+- 模型价格全局/按 key 覆盖、价格优先级、缓存价计费；
+- SQLite v1 → v2 自动迁移；
 - 无效 key、停用/吊销/轮换；
 - 多下游 key 共用一个上游 key；
 - 非流式 usage 计费、上游错误不计费、无 usage 兜底估算；
 - SSE 流式 usage 注入、分块解析、无 usage 兜底；
-- 分块请求体、健康检查、模型查询；
+- 分块请求体、健康检查、模型查询、上游 keep-alive 复用；
 - 配置解析、上游路径映射、金额和周期计算。
 
 ## 已知限制
 
 - 仅支持 OpenAI 兼容协议；不原生支持 Anthropic Messages API。
 - 没有图片、音频、视频等非 token 计费模型。
+- 模型价格按模型 ID 精确匹配，不支持通配符/正则。
+- 缓存命中 token 依赖上游 usage 字段；上游不返回时按普通输入价计费。
 - 本地估算不是精确 tokenizer；精确金额依赖上游 usage。
 - 配额时区使用固定 UTC 偏移，不支持带夏令时的 IANA 时区（默认 UTC+08:00 不受影响）。
 - 配额预占是单进程内存状态，不支持多实例共享。
 - 管理面只有 CLI；没有 Web UI，也不会额外开放管理端口。
 - 没有内置预付费余额/充值。
+- Linux 一键部署假定 systemd 和系统 Python 3.10+；非 systemd 环境请手动运行。
 
 ## 版本管理
 

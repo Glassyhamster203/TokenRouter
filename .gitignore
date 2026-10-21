@@ -1,0 +1,30 @@
+# Runtime data and local secrets
+data/
+.test-tmp/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+logs/
+.env
+.env.*
+config.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# Agent workspace metadata
+.dide/

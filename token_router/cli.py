@@ -9,6 +9,7 @@ import os
 import sqlite3
 import sys
 import time
+from pathlib import Path
 from typing import Any, Sequence
 
 from . import __version__
@@ -16,6 +17,7 @@ from .config import (
     CONFIG_ENV,
     Config,
     ConfigError,
+    ensure_default_config,
     load_config,
     resolve_config_path,
     write_default_config,
@@ -51,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser = subparsers.add_parser("init", help="创建配置和 SQLite 数据库")
     init_parser.add_argument("--force", action="store_true", help="覆盖已有配置文件")
     init_parser.add_argument("--upstream-base-url", help="上游 OpenAI 兼容 API 基础地址")
+    init_parser.add_argument("--format", choices=["json", "toml"], help="配置格式（默认按后缀；.toml 为 TOML）")
     init_parser.set_defaults(func=cmd_init)
 
     serve_parser = subparsers.add_parser("serve", help="启动网关（仅此一个端口）")
@@ -74,6 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--monthly-cost", help="每月费用限额，单位同配置 currency")
     create_parser.add_argument("--price-in", help="输入价格 / 百万 token（覆盖默认）")
     create_parser.add_argument("--price-out", help="输出价格 / 百万 token（覆盖默认）")
+    create_parser.add_argument(
+        "--allowed-model",
+        action="append",
+        default=None,
+        help="允许的模型/通配模式，可重复；不填表示全部允许",
+    )
     create_parser.add_argument("--note", default="", help="备注")
     create_parser.set_defaults(func=cmd_key_create)
 
@@ -114,6 +123,18 @@ def build_parser() -> argparse.ArgumentParser:
     rotate_parser.add_argument("reference", help="key ID 或前缀")
     rotate_parser.add_argument("--yes", action="store_true", help="跳过确认")
     rotate_parser.set_defaults(func=cmd_key_rotate)
+
+    models_parser = key_sub.add_parser("models", help="查看或设置 key 可用的模型")
+    models_sub = models_parser.add_subparsers(dest="models_command", required=True, metavar="操作")
+    models_show = models_sub.add_parser("show", help="查看模型权限")
+    models_show.add_argument("reference", help="key ID 或前缀")
+    models_show.set_defaults(func=cmd_key_models_show)
+    models_set = models_sub.add_parser("set", help="设置模型权限（精确名称或通配模式）")
+    models_set.add_argument("reference", help="key ID 或前缀")
+    models_set.add_argument("--model", action="append", default=None, help="允许的模型/模式，可重复")
+    models_set.add_argument("--all", action="store_true", help="取消限制，允许全部模型")
+    models_set.add_argument("--none", action="store_true", help="禁止所有模型")
+    models_set.set_defaults(func=cmd_key_models_set)
 
     usage_parser = subparsers.add_parser("usage", help="按日/月查看各 key 用量与限额")
     usage_parser.add_argument("--key", help="只显示指定 key（ID 或前缀）")
@@ -177,7 +198,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 # --------------------------------------------------------------------------- init
 def cmd_init(args: argparse.Namespace) -> int:
-    path = resolve_config_path(args.config)
+    if args.format == "toml" and not args.config and not os.environ.get(CONFIG_ENV):
+        path = (Path.cwd() / "config.toml").resolve()
+    else:
+        path = resolve_config_path(args.config)
     updates: dict[str, Any] = {}
     if args.upstream_base_url:
         updates["upstream_base_url"] = args.upstream_base_url
@@ -188,7 +212,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             )
         print(f"配置已存在，保留现有文件：{path}")
     else:
-        written = write_default_config(path, force=args.force, updates=updates)
+        written = write_default_config(path, force=args.force, updates=updates, format=args.format)
         print(f"已写入配置：{written}")
     config = load_config(path, require_exists=True)
     db = Database(config.database_path, config.timezone_offset_minutes)
@@ -211,6 +235,15 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 # -------------------------------------------------------------------------- serve
 def cmd_serve(args: argparse.Namespace) -> int:
+    config_path = resolve_config_path(args.config)
+    if not config_path.exists():
+        generated, _ = ensure_default_config(args.config)
+        print(
+            f"首次启动：已生成默认配置文件 {generated}\n"
+            "请在其中填写 upstream_api_key（或设置环境变量），并按需添加 users；"
+            "修改后重新启动即可。",
+            flush=True,
+        )
     config = _load_config(args)
     if args.host:
         config = config.with_overrides(host=args.host)
@@ -311,6 +344,7 @@ def cmd_key_create(args: argparse.Namespace) -> int:
         daily_cost_limit_micros=daily_cost,
         monthly_cost_limit_micros=monthly_cost,
         note=args.note,
+        allowed_models=tuple(args.allowed_model) if args.allowed_model else None,
     )
     print(f"已创建 key #{key.id}（{key.name}）")
     print()
@@ -321,6 +355,7 @@ def cmd_key_create(args: argparse.Namespace) -> int:
     print(f"输入价格：  {format_price_per_mtok(key.price_in_micros_per_mtok, config.currency_symbol)}")
     print(f"输出价格：  {format_price_per_mtok(key.price_out_micros_per_mtok, config.currency_symbol)}")
     print("缓存命中：  默认按输入价；可用 price set 为具体模型设置")
+    print(f"模型权限：  {_models_text(key.allowed_models)}")
     print(f"每日限额：  {_limit_text(key.daily_token_limit)} tokens / {_cost_limit_text(key.daily_cost_limit_micros, config)}")
     print(f"每月限额：  {_limit_text(key.monthly_token_limit)} tokens / {_cost_limit_text(key.monthly_cost_limit_micros, config)}")
     print()
@@ -349,11 +384,12 @@ def cmd_key_list(args: argparse.Namespace) -> int:
                 _limit_text(key.monthly_token_limit),
                 _cost_limit_text(key.daily_cost_limit_micros, config),
                 _cost_limit_text(key.monthly_cost_limit_micros, config),
+                _models_text(key.allowed_models),
             ]
         )
     print(
         format_table(
-            ["ID", "名称", "前缀", "状态", "输入价", "输出价", "日token", "月token", "日费用", "月费用"],
+            ["ID", "名称", "前缀", "状态", "输入价", "输出价", "日token", "月token", "日费用", "月费用", "模型权限"],
             rows,
             numeric=[0],
         )
@@ -376,6 +412,7 @@ def cmd_key_show(args: argparse.Namespace) -> int:
     print("  缓存命中：  默认按输入价")
     overrides = db.list_model_prices(key_id=key.id, include_global=False)
     print(f"  模型覆盖：  {len(overrides)} 条（price list --key {key.id}）")
+    print(f"  模型权限：  {_models_text(key.allowed_models)}")
     print(f"  备注：      {key.note or '-'}")
     print()
     _print_period_detail("今日", day, key.daily_token_limit, key.daily_cost_limit_micros, config, bounds.next_day)
@@ -463,6 +500,36 @@ def cmd_key_rotate(args: argparse.Namespace) -> int:
     print("新的 API key（只显示这一次）：")
     print(f"  {raw_key}")
     print(f"旧前缀 {key.key_prefix} 已失效。")
+    return 0
+
+
+def cmd_key_models_show(args: argparse.Namespace) -> int:
+    _, db = _config_and_db(args)
+    key = db.resolve_key(args.reference)
+    print(f"Key #{key.id}（{key.name}）模型权限：{_models_text(key.allowed_models)}")
+    if key.allowed_models:
+        for pattern in key.allowed_models:
+            print(f"  - {pattern}")
+    return 0
+
+
+def cmd_key_models_set(args: argparse.Namespace) -> int:
+    _, db = _config_and_db(args)
+    key = db.resolve_key(args.reference)
+    chosen = sum(bool(value) for value in (args.all, args.none, args.model))
+    if chosen != 1:
+        raise UserError("请指定 --all、--none 或一个/多个 --model，且只能选择一种方式")
+    if args.all:
+        allowed: tuple[str, ...] | None = None
+        label = "全部模型"
+    elif args.none:
+        allowed = ()
+        label = "禁止全部模型"
+    else:
+        allowed = tuple(args.model or ())
+        label = "、".join(allowed)
+    updated = db.update_key(key.id, allowed_models=allowed)
+    print(f"已更新 key #{updated.id}（{updated.name}）模型权限：{label}")
     return 0
 
 
@@ -759,6 +826,15 @@ def _cost_limit_text(value: int | None, config: Config) -> str:
     return "不限" if value is None else format_amount(value, config.currency_symbol)
 
 
+def _models_text(allowed_models: tuple[str, ...] | None) -> str:
+    if allowed_models is None:
+        return "全部"
+    if not allowed_models:
+        return "禁止"
+    rendered = "、".join(allowed_models)
+    return rendered if len(rendered) <= 80 else rendered[:77] + "..."
+
+
 def _remaining_text(limit: int | None, used: int) -> str:
     if limit is None:
         return "不限"
@@ -820,6 +896,9 @@ def _overview_json(item: KeyUsageOverview, config: Config) -> dict[str, Any]:
         "revoked": item.key.revoked_at is not None,
         "price_in_micros_per_mtok": item.key.price_in_micros_per_mtok,
         "price_out_micros_per_mtok": item.key.price_out_micros_per_mtok,
+        "allowed_models": (
+            list(item.key.allowed_models) if item.key.allowed_models is not None else None
+        ),
         "day": {
             **_totals_json(item.day),
             "token_limit": item.key.daily_token_limit,

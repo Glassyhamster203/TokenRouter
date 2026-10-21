@@ -6,7 +6,13 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from token_router.config import Config, ConfigError, load_config, write_default_config
+from token_router.config import (
+    Config,
+    ConfigError,
+    ensure_default_config,
+    load_config,
+    write_default_config,
+)
 from token_router.upstream import UpstreamClient
 from token_router.usage import (
     SSEUsageExtractor,
@@ -227,6 +233,113 @@ class ConfigAndUpstreamTests(unittest.TestCase):
         with workspace_temp_dir() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text('{"nope": 1}', encoding="utf-8")
+            with self.assertRaises(ConfigError):
+                load_config(path, require_exists=True)
+
+    def test_toml_config_with_users_and_inline_key(self) -> None:
+        with workspace_temp_dir() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                """
+host = "127.0.0.1"
+port = 9123
+upstream_base_url = "https://example.com/v1"
+upstream_api_key = "sk-file-secret"
+
+[[users]]
+name = "alice"
+api_key = "tr_alice_key_1234567890"
+daily_token_limit = "2m"
+monthly_token_limit = 10_000_000
+daily_cost_limit = 1.5
+allowed_models = ["gpt-4o*", "o3"]
+note = "team a"
+
+[[users]]
+name = "bob"
+api_key = "tr_bob_key_1234567890"
+allowed_models = []
+enabled = false
+""",
+                encoding="utf-8",
+            )
+            old_env = {name: os.environ.pop(name, None) for name in ("TR_UPSTREAM_API_KEY", "TOKEN_ROUTER_UPSTREAM_KEY")}
+            try:
+                config = load_config(path, require_exists=True)
+            finally:
+                for name, value in old_env.items():
+                    if value is not None:
+                        os.environ[name] = value
+            self.assertEqual(config.config_format, "toml")
+            self.assertEqual(config.port, 9123)
+            self.assertEqual(config.upstream_api_key, "sk-file-secret")
+            self.assertEqual(config.upstream_api_key_source, "file")
+            self.assertEqual(len(config.users), 2)
+            alice = config.users[0]
+            self.assertEqual(alice.daily_token_limit, 2_000_000)
+            self.assertEqual(alice.daily_cost_limit_micros, 1_500_000)
+            self.assertEqual(alice.allowed_models, ("gpt-4o*", "o3"))
+            self.assertFalse(config.users[1].enabled)
+            self.assertEqual(config.users[1].allowed_models, ())
+
+    def test_example_toml_is_valid(self) -> None:
+        path = Path(__file__).resolve().parent.parent / "config.example.toml"
+        config = load_config(path, require_exists=True)
+        self.assertEqual(config.config_format, "toml")
+        self.assertEqual(len(config.users), 2)
+        self.assertEqual(config.users[0].allowed_models, ("gpt-4o-mini", "gpt-4o*"))
+        self.assertEqual(config.users[1].allowed_models, ())
+
+    def test_first_start_auto_generates_json_and_toml(self) -> None:
+        with workspace_temp_dir() as tmp:
+            json_path = Path(tmp) / "config.json"
+            generated, was_created = ensure_default_config(json_path)
+            self.assertTrue(was_created)
+            self.assertEqual(generated, json_path.resolve())
+            json_config = load_config(json_path, require_exists=True)
+            self.assertEqual(json_config.config_format, "json")
+            self.assertEqual(json_config.users, ())
+            self.assertIsNone(json_config.upstream_api_key)
+            self.assertIn('"users": []', json_path.read_text(encoding="utf-8"))
+
+            toml_path = Path(tmp) / "config.toml"
+            generated_toml, was_created_toml = ensure_default_config(toml_path)
+            self.assertTrue(was_created_toml)
+            toml_config = load_config(toml_path, require_exists=True)
+            self.assertEqual(toml_config.config_format, "toml")
+            self.assertEqual(toml_config.users, ())
+            self.assertIn("users = []", toml_path.read_text(encoding="utf-8"))
+
+    def test_config_user_duplicates_and_bad_models_are_rejected(self) -> None:
+        with workspace_temp_dir() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "users": [
+                            {
+                                "name": "same",
+                                "api_key": "tr_same_key_1234567890",
+                                "allowed_models": "not-a-list",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ConfigError):
+                load_config(path, require_exists=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "users": [
+                            {"name": "same", "api_key": "tr_same_key_1234567890"},
+                            {"name": "same", "api_key": "tr_other_key_1234567890"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
             with self.assertRaises(ConfigError):
                 load_config(path, require_exists=True)
 

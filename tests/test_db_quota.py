@@ -112,6 +112,50 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue(self.db.remove_model_price("gpt-x"))
         self.assertEqual(self.db.resolve_price(key, "gpt-x").source, "key-default")
 
+    def test_allowed_models_crud_and_matching(self) -> None:
+        key = self._create_key("models")
+        self.assertIsNone(key.allowed_models)
+        self.assertTrue(key.allows_model("anything"))
+        updated = self.db.update_key(key.id, allowed_models=["gpt-4o*", "o3", "o3"])
+        self.assertEqual(updated.allowed_models, ("gpt-4o*", "o3"))
+        self.assertTrue(updated.allows_model("gpt-4o-mini"))
+        self.assertTrue(updated.allows_model("o3"))
+        self.assertFalse(updated.allows_model("claude"))
+        denied = self.db.update_key(key.id, allowed_models=[])
+        self.assertEqual(denied.allowed_models, ())
+        self.assertFalse(denied.allows_model("gpt-4o-mini"))
+        unlimited = self.db.update_key(key.id, allowed_models=None)
+        self.assertIsNone(unlimited.allowed_models)
+        self.assertTrue(unlimited.allows_model("anything"))
+        wildcard = self._create_key("wildcard", allowed_models=["*"])
+        self.assertEqual(wildcard.allowed_models, ("*",))
+        self.assertTrue(wildcard.allows_model("any-model"))
+
+    def test_sync_key_from_config(self) -> None:
+        key = self._create_key("sync-me")
+        updated = self.db.sync_key_from_config(
+            key_id=key.id,
+            name="synced",
+            api_key="tr_synced_key_1234567890",
+            daily_token_limit=123,
+            monthly_token_limit=456,
+            daily_cost_limit_micros=10,
+            monthly_cost_limit_micros=20,
+            allowed_models=["gpt-4o-mini"],
+            enabled=False,
+            note="from file",
+        )
+        self.assertEqual(updated.name, "synced")
+        self.assertFalse(updated.enabled)
+        self.assertEqual(updated.allowed_models, ("gpt-4o-mini",))
+        self.assertEqual(updated.daily_token_limit, 123)
+        self.assertEqual(updated.note, "from file")
+        self.assertIsNone(self.db.get_key_by_hash(hash_api_key("tr_unit_test_key_sync-me")))
+        found = self.db.get_key_by_hash(hash_api_key("tr_synced_key_1234567890"))
+        assert found is not None
+        self.assertEqual(found.id, key.id)
+        self.assertEqual(self.db.get_key_by_name("synced").id, key.id)  # type: ignore[union-attr]
+
     def test_record_request_tracks_cached_tokens(self) -> None:
         key = self._create_key()
         now = int(time.time())
@@ -138,7 +182,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(log.cached_input_tokens, 60)
         self.assertEqual(log.cost_micros, 210)
 
-    def test_v1_database_is_migrated_to_v2(self) -> None:
+    def test_v1_database_is_migrated_to_v3(self) -> None:
         path = Path(self.tmp.name) / "legacy" / "router.db"
         path.parent.mkdir(parents=True)
         conn = sqlite3.connect(path)
@@ -208,10 +252,12 @@ class DatabaseTests(unittest.TestCase):
         self.addCleanup(legacy.close_thread_connection)
         conn = sqlite3.connect(path)
         try:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
             for table in ("usage_buckets", "request_log"):
                 columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
                 self.assertIn("cached_input_tokens", columns)
+            key_columns = {row[1] for row in conn.execute("PRAGMA table_info(api_keys)")}
+            self.assertIn("allowed_models", key_columns)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM model_prices").fetchone()[0], 0)
             self.assertEqual(
                 conn.execute("SELECT cached_input_tokens FROM usage_buckets").fetchone()[0], 0

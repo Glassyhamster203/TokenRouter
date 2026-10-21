@@ -435,6 +435,45 @@ class ProxyIntegrationTests(unittest.TestCase):
         day, _ = self.db.get_period_usage(key.id, bounds)
         self.assertEqual(day.requests, 0)
 
+    def test_key_model_permissions_are_enforced(self) -> None:
+        key, raw = self._new_key("permissions")
+        self.db.update_key(key.id, allowed_models=["fake"])
+        status, _, body = self._request(
+            "POST",
+            "/v1/chat/completions",
+            raw,
+            {"model": "cached", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)["error"]["code"], "model_not_allowed")
+        self.assertEqual(FakeUpstreamState.snapshot(), [])
+
+        status, _, _ = self._request(
+            "POST",
+            "/v1/chat/completions",
+            raw,
+            {"model": "fake", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10},
+        )
+        self.assertEqual(status, 200)
+
+        self.db.update_key(key.id, allowed_models=["gpt-4o*"])
+        status, _, _ = self._request(
+            "POST",
+            "/v1/chat/completions",
+            raw,
+            {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10},
+        )
+        self.assertEqual(status, 200)
+
+        self.db.update_key(key.id, allowed_models=[])
+        status, _, _ = self._request(
+            "POST",
+            "/v1/chat/completions",
+            raw,
+            {"model": "fake", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10},
+        )
+        self.assertEqual(status, 403)
+
     def test_models_endpoint_is_proxied_and_not_metered(self) -> None:
         key, raw = self._new_key("models")
         status, _, body = self._request("GET", "/v1/models", raw)

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import fnmatch
+import json
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from .usage import TokenUsage
 from .util import (
@@ -19,7 +21,7 @@ from .util import (
     period_bounds,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class DatabaseError(RuntimeError):
@@ -42,6 +44,7 @@ class ApiKey:
     daily_cost_limit_micros: int | None
     monthly_cost_limit_micros: int | None
     note: str
+    allowed_models: tuple[str, ...] | None = None
 
     @property
     def active(self) -> bool:
@@ -52,6 +55,11 @@ class ApiKey:
 
     def cost_limit(self, period: str) -> int | None:
         return self.daily_cost_limit_micros if period == "day" else self.monthly_cost_limit_micros
+
+    def allows_model(self, model: str) -> bool:
+        if self.allowed_models is None:
+            return True
+        return any(fnmatch.fnmatchcase(model, pattern) for pattern in self.allowed_models)
 
 
 @dataclass(frozen=True)
@@ -162,7 +170,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     monthly_token_limit INTEGER CHECK (monthly_token_limit IS NULL OR monthly_token_limit >= 0),
     daily_cost_limit_micros INTEGER CHECK (daily_cost_limit_micros IS NULL OR daily_cost_limit_micros >= 0),
     monthly_cost_limit_micros INTEGER CHECK (monthly_cost_limit_micros IS NULL OR monthly_cost_limit_micros >= 0),
-    note TEXT NOT NULL DEFAULT ''
+    note TEXT NOT NULL DEFAULT '',
+    allowed_models TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix);
@@ -264,6 +273,26 @@ def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
+    """Add per-key allowed-model permissions to a v2 database."""
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(api_keys)").fetchall()
+        }
+        if "allowed_models" not in columns:
+            conn.execute("ALTER TABLE api_keys ADD COLUMN allowed_models TEXT")
+        conn.execute("PRAGMA user_version=3")
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+
+
 class Database:
     def __init__(self, path: str | Path, utc_offset_minutes: int = 480) -> None:
         self.path = Path(path)
@@ -289,10 +318,15 @@ class Database:
             if version == 0:
                 conn.executescript(_SCHEMA)
                 conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-            elif version == 1:
-                _migrate_1_to_2(conn)
-            elif version < SCHEMA_VERSION:
-                raise DatabaseError(f"数据库 schema 版本过旧：{version}")
+            else:
+                if version == 1:
+                    _migrate_1_to_2(conn)
+                    version = 2
+                if version == 2:
+                    _migrate_2_to_3(conn)
+                    version = 3
+                if version < SCHEMA_VERSION:
+                    raise DatabaseError(f"数据库 schema 版本过旧：{version}")
         finally:
             conn.close()
 
@@ -356,10 +390,12 @@ class Database:
         daily_cost_limit_micros: int | None = None,
         monthly_cost_limit_micros: int | None = None,
         note: str = "",
+        allowed_models: Sequence[str] | None = None,
         now: int | None = None,
     ) -> ApiKey:
         clean_name = _clean_name(name)
         clean_note = _clean_note(note)
+        serialized_models = _serialize_allowed_models(allowed_models)
         _validate_key_limits(
             price_in_micros_per_mtok,
             price_out_micros_per_mtok,
@@ -376,8 +412,9 @@ class Database:
                     name, key_hash, key_prefix, enabled, created_at,
                     price_in_micros_per_mtok, price_out_micros_per_mtok,
                     daily_token_limit, monthly_token_limit,
-                    daily_cost_limit_micros, monthly_cost_limit_micros, note
-                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                    daily_cost_limit_micros, monthly_cost_limit_micros, note,
+                    allowed_models
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     clean_name,
@@ -391,6 +428,7 @@ class Database:
                     daily_cost_limit_micros,
                     monthly_cost_limit_micros,
                     clean_note,
+                    serialized_models,
                 ),
             )
             key_id = int(cursor.lastrowid)
@@ -407,6 +445,14 @@ class Database:
             "SELECT * FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL",
             (key_hash,),
         ).fetchone()
+        return _key_from_row(row) if row is not None else None
+
+    def get_key_by_name(self, name: str, *, include_revoked: bool = True) -> ApiKey | None:
+        sql = "SELECT * FROM api_keys WHERE name = ?"
+        if not include_revoked:
+            sql += " AND revoked_at IS NULL"
+        sql += " ORDER BY id LIMIT 1"
+        row = self._connect().execute(sql, (name.strip(),)).fetchone()
         return _key_from_row(row) if row is not None else None
 
     def list_keys(self, *, include_revoked: bool = False) -> list[ApiKey]:
@@ -445,6 +491,7 @@ class Database:
             "monthly_cost_limit_micros",
             "note",
             "enabled",
+            "allowed_models",
         }
         unknown = set(changes) - allowed
         if unknown:
@@ -458,6 +505,8 @@ class Database:
             changes["note"] = _clean_note(str(changes["note"]))
         if "enabled" in changes:
             changes["enabled"] = 1 if changes["enabled"] else 0
+        if "allowed_models" in changes:
+            changes["allowed_models"] = _serialize_allowed_models(changes["allowed_models"])
         for field_name in (
             "price_in_micros_per_mtok",
             "price_out_micros_per_mtok",
@@ -508,6 +557,59 @@ class Database:
             )
             if cursor.rowcount == 0:
                 raise UserError(f"key #{key_id} 不存在")
+        return self.get_key(key_id)
+
+    def sync_key_from_config(
+        self,
+        *,
+        key_id: int,
+        name: str,
+        api_key: str,
+        daily_token_limit: int | None,
+        monthly_token_limit: int | None,
+        daily_cost_limit_micros: int | None,
+        monthly_cost_limit_micros: int | None,
+        allowed_models: Sequence[str] | None,
+        enabled: bool,
+        note: str = "",
+    ) -> ApiKey:
+        """Update a non-revoked key from the declarative config file."""
+
+        clean_name = _clean_name(name)
+        clean_note = _clean_note(note)
+        serialized_models = _serialize_allowed_models(allowed_models)
+        _validate_key_limits(
+            daily_token_limit,
+            monthly_token_limit,
+            daily_cost_limit_micros,
+            monthly_cost_limit_micros,
+        )
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE api_keys SET
+                    name = ?, key_hash = ?, key_prefix = ?,
+                    daily_token_limit = ?, monthly_token_limit = ?,
+                    daily_cost_limit_micros = ?, monthly_cost_limit_micros = ?,
+                    allowed_models = ?, enabled = ?, note = ?
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (
+                    clean_name,
+                    hash_api_key(api_key),
+                    api_key_prefix(api_key),
+                    daily_token_limit,
+                    monthly_token_limit,
+                    daily_cost_limit_micros,
+                    monthly_cost_limit_micros,
+                    serialized_models,
+                    1 if enabled else 0,
+                    clean_note,
+                    key_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise UserError(f"key #{key_id} 不存在或已经吊销")
         return self.get_key(key_id)
 
     # ------------------------------------------------------------------- prices
@@ -843,6 +945,41 @@ def _clean_model(model: str) -> str:
     return clean
 
 
+def _serialize_allowed_models(models: Sequence[str] | None) -> str | None:
+    if models is None:
+        return None
+    if isinstance(models, str):
+        raise UserError("allowed_models 必须是字符串列表，不能是单个字符串")
+    patterns: list[str] = []
+    for item in models:
+        if not isinstance(item, str):
+            raise UserError("allowed_models 只能包含字符串")
+        clean = item.strip()
+        if not clean:
+            raise UserError("allowed_models 不能包含空字符串")
+        if len(clean) > 200 or any(char in clean for char in "\r\n\x00"):
+            raise UserError("allowed_models 中的模式非法")
+        if clean not in patterns:
+            patterns.append(clean)
+    if "*" in patterns:
+        patterns = ["*"]
+    if len(patterns) > 500:
+        raise UserError("allowed_models 最多 500 个模式")
+    return json.dumps(patterns, ensure_ascii=False, separators=(",", ":"))
+
+
+def _deserialize_allowed_models(value: str | None, key_id: int) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise DatabaseError(f"key #{key_id} 的 allowed_models 数据损坏") from exc
+    if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
+        raise DatabaseError(f"key #{key_id} 的 allowed_models 数据格式非法")
+    return tuple(parsed)
+
+
 def _key_from_row(row: sqlite3.Row) -> ApiKey:
     return ApiKey(
         id=int(row["id"]),
@@ -869,6 +1006,7 @@ def _key_from_row(row: sqlite3.Row) -> ApiKey:
             else None
         ),
         note=str(row["note"]),
+        allowed_models=_deserialize_allowed_models(row["allowed_models"], int(row["id"])),
     )
 
 

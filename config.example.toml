@@ -1,0 +1,43 @@
+# TokenRouter TOML 配置示例。
+# 复制为 config.toml 后，用 --config config.toml 或 TR_CONFIG 指向它。
+# 也可以直接使用 JSON；首次 serve 找不到配置时会自动生成带默认值的 config.json。
+
+host = "127.0.0.1"
+port = 8787
+upstream_base_url = "https://api.openai.com/v1"
+# 推荐用环境变量 TOKEN_ROUTER_UPSTREAM_KEY；也可直接填在这里（注意文件权限）。
+upstream_api_key = ""
+upstream_api_key_env = "TOKEN_ROUTER_UPSTREAM_KEY"
+upstream_auth_header = "Authorization"
+upstream_auth_scheme = "Bearer "
+data_dir = "data"
+database_file = "router.db"
+timezone_offset_minutes = 480
+currency = "USD"
+currency_symbol = "$"
+default_price_in_micros_per_mtok = 0
+default_price_out_micros_per_mtok = 0
+default_max_output_tokens = 4096
+max_concurrency = 128
+inject_stream_usage = true
+verify_upstream_tls = true
+log_level = "INFO"
+
+[[users]]
+name = "team-a"
+api_key = "tr_REPLACE_WITH_A_LONG_RANDOM_DOWNSTREAM_KEY"
+daily_token_limit = "2m"
+monthly_token_limit = "30m"
+daily_cost_limit = 5.0
+monthly_cost_limit = 80.0
+allowed_models = ["gpt-4o-mini", "gpt-4o*"]
+enabled = true
+note = "示例用户：只允许 gpt-4o 系列"
+
+[[users]]
+name = "readonly"
+api_key = "tr_REPLACE_WITH_ANOTHER_DOWNSTREAM_KEY"
+daily_token_limit = 100_000
+allowed_models = []
+enabled = true
+note = "allowed_models = [] 表示禁止所有模型"

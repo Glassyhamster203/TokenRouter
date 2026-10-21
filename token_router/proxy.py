@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 
 from . import __version__
 from .config import Config
+from .config_users import sync_config_users
 from .db import ApiKey, Database
 from .quota import QuotaExceeded, QuotaManager, Reservation
 from .upstream import (
@@ -89,6 +90,7 @@ class RouterApplication:
 
     def close(self) -> None:
         self.upstream.close()
+        self.db.close_thread_connection()
 
 
 class BadRequest(Exception):
@@ -328,6 +330,23 @@ class TokenRouterHandler(BaseHTTPRequestHandler):
                 return
             model = payload.get("model")
             self._model = model[:200] if isinstance(model, str) else None
+            if key.allowed_models is not None:
+                requested_model = model.strip() if isinstance(model, str) and model.strip() else None
+                if requested_model is None or not key.allows_model(requested_model):
+                    self._send_json(
+                        403,
+                        _error_body(
+                            "Model is not allowed for this API key",
+                            "permission_error",
+                            "model_not_allowed",
+                            details={
+                                "model": requested_model,
+                                "allowed_models": list(key.allowed_models),
+                            },
+                        ),
+                        close=False,
+                    )
+                    return
 
         try:
             reservation = app.quota.reserve(key, payload, endpoint, now=self._started_wall)
@@ -804,6 +823,14 @@ def build_application(config: Config) -> RouterApplication:
     db = Database(config.database_path, config.timezone_offset_minutes)
     db.initialize()
     upstream_key = config.require_upstream_api_key()
+    if config.users:
+        summary = sync_config_users(config, db)
+        logger.info(
+            "config users synced: created=%d updated=%d skipped_revoked=%d",
+            summary.created,
+            summary.updated,
+            summary.skipped_revoked,
+        )
     upstream = UpstreamClient(config, upstream_key)
     quota = QuotaManager(db, config)
     return RouterApplication(

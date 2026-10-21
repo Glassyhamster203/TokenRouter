@@ -2,6 +2,7 @@
   "host": "127.0.0.1",
   "port": 8787,
   "upstream_base_url": "https://api.openai.com/v1",
+  "upstream_api_key": "",
   "upstream_api_key_env": "TOKEN_ROUTER_UPSTREAM_KEY",
   "upstream_auth_header": "Authorization",
   "upstream_auth_scheme": "Bearer ",
@@ -25,5 +26,6 @@
   "inject_stream_usage": true,
   "verify_upstream_tls": true,
   "upstream_ca_file": null,
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "users": []
 }

@@ -21,6 +21,7 @@ from token_router.util import (
     estimate_text_tokens,
     format_amount,
     parse_money_to_micros,
+    parse_optional_money,
     parse_token_quantity,
     period_bounds,
 )
@@ -44,6 +45,8 @@ class UtilTests(unittest.TestCase):
     def test_money_and_cost(self) -> None:
         self.assertEqual(parse_money_to_micros("2.50"), 2_500_000)
         self.assertEqual(parse_money_to_micros("0.000001"), 1)
+        self.assertIsNone(parse_optional_money("none"))
+        self.assertEqual(parse_optional_money("2.5"), 2_500_000)
         self.assertEqual(format_amount(2_500_000, "$"), "$2.5")
         self.assertEqual(format_amount(1, "$"), "$0.000001")
         self.assertEqual(cost_micros(1_000_000, 0, 1_000_000, 0), 1_000_000)

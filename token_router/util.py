@@ -74,6 +74,14 @@ def parse_money_to_micros(value: str) -> int:
     return micros
 
 
+def parse_optional_money(value: str) -> int | None:
+    """Parse a cost limit, accepting ``none``/``unlimited`` as no limit."""
+
+    if value.strip().lower() in {"none", "unlimited", "off", "-"}:
+        return None
+    return parse_money_to_micros(value)
+
+
 def parse_price_to_micros_per_mtok(value: str) -> int:
     """Parse a price per 1M tokens into integer micro-units per 1M tokens."""
 

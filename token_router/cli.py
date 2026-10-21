@@ -30,7 +30,7 @@ from .util import (
     format_table,
     format_timestamp,
     generate_api_key,
-    parse_money_to_micros,
+    parse_optional_money,
     parse_price_to_micros_per_mtok,
     parse_token_quantity,
     period_bounds,
@@ -270,8 +270,8 @@ def cmd_key_create(args: argparse.Namespace) -> int:
     )
     daily_tokens = parse_token_quantity(args.daily_tokens) if args.daily_tokens is not None else None
     monthly_tokens = parse_token_quantity(args.monthly_tokens) if args.monthly_tokens is not None else None
-    daily_cost = parse_money_to_micros(args.daily_cost) if args.daily_cost is not None else None
-    monthly_cost = parse_money_to_micros(args.monthly_cost) if args.monthly_cost is not None else None
+    daily_cost = parse_optional_money(args.daily_cost) if args.daily_cost is not None else None
+    monthly_cost = parse_optional_money(args.monthly_cost) if args.monthly_cost is not None else None
     raw_key = generate_api_key()
     key = db.create_key(
         name=args.name,
@@ -382,7 +382,7 @@ def cmd_key_update(args: argparse.Namespace) -> int:
     ):
         value = getattr(args, attr, _UNSET)
         if value is not _UNSET:
-            changes[field_name] = parse_money_to_micros(value)
+            changes[field_name] = parse_optional_money(value)
     if not changes:
         raise UserError("没有提供要修改的字段")
     updated = db.update_key(key.id, **changes)

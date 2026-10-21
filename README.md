@@ -72,7 +72,7 @@ set TOKEN_ROUTER_UPSTREAM_KEY=sk-你的真实上游key
 ```
 
 - `--daily-tokens` / `--monthly-tokens` 支持 `100k`、`1.5m`、`2b`，`none` 表示不限。
-- `--daily-cost` / `--monthly-cost` 的单位由 `config.json` 的 `currency` 决定。
+- `--daily-cost` / `--monthly-cost` 的单位由 `config.json` 的 `currency` 决定；`none` 表示不限。
 - `--price-in` / `--price-out` 表示**每 100 万 token** 的价格；不填则使用配置中的默认价。
 - 明文 key 只显示一次，请立即保存。
 
@@ -98,7 +98,7 @@ $key = "tr_创建时显示的key"
 curl.exe http://127.0.0.1:8787/v1/chat/completions `
   -H "Authorization: Bearer $key" `
   -H "Content-Type: application/json" `
-  -d '{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}],\"max_tokens\":128}'
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"你好"}],"max_tokens":128}'
 ```
 
 Python OpenAI SDK（SDK 是下游依赖，不是路由器依赖）：

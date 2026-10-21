@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -230,6 +231,50 @@ class QuotaTests(unittest.TestCase):
         )
         day, _ = self.db.get_period_usage(key.id, period_bounds(self.now, 480))
         self.assertEqual(day.requests, 0)
+
+    def test_concurrent_reservations_are_serialized(self) -> None:
+        key = self._key(daily_token_limit=50)
+        barrier = threading.Barrier(10)
+        successes: list[object] = []
+        failures: list[int] = []
+        lock = threading.Lock()
+
+        def worker(index: int) -> None:
+            try:
+                barrier.wait(timeout=5)
+                try:
+                    reservation = self.quota.reserve(
+                        key, self.payload, "/v1/chat/completions", now=self.now
+                    )
+                    with lock:
+                        successes.append(reservation)
+                except QuotaExceeded:
+                    with lock:
+                        failures.append(index)
+            finally:
+                self.db.close_thread_connection()
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(10)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertTrue(successes)
+        self.assertTrue(failures)
+        reserved, _ = self.quota.reserved_for(key.id)
+        self.assertLessEqual(reserved, 50)
+        for index, reservation in enumerate(successes):
+            self.quota.settle(
+                reservation,  # type: ignore[arg-type]
+                request_id=f"req_concurrent_{index}",
+                endpoint="/v1/chat/completions",
+                model="fake",
+                status=200,
+                usage=TokenUsage(),
+                latency_ms=1,
+                client_ip="127.0.0.1",
+            )
+        self.assertEqual(self.quota.reserved_for(key.id), (0, 0))
 
 
 if __name__ == "__main__":

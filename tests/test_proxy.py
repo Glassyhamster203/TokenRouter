@@ -63,6 +63,7 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
                 "path": self.path,
                 "authorization": self.headers.get("Authorization"),
                 "body": None,
+                "client_port": self.client_address[1],
             }
         )
         if self.path == "/v1/models":
@@ -82,6 +83,7 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
                 "path": self.path,
                 "authorization": self.headers.get("Authorization"),
                 "body": payload,
+                "client_port": self.client_address[1],
             }
         )
         if self.path != "/v1/chat/completions":
@@ -302,6 +304,19 @@ class ProxyIntegrationTests(unittest.TestCase):
         day_b, _ = self.db.get_period_usage(key_b.id, bounds)
         self.assertEqual(day_a.total_tokens, 15)
         self.assertEqual(day_b.total_tokens, 15)
+
+    def test_upstream_keepalive_pool_reuses_connections(self) -> None:
+        _, raw = self._new_key("keepalive")
+        for _ in range(3):
+            status, _, _ = self._request(
+                "POST",
+                "/v1/chat/completions",
+                raw,
+                {"model": "fake", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10},
+            )
+            self.assertEqual(status, 200)
+        ports = {item["client_port"] for item in FakeUpstreamState.snapshot()}
+        self.assertEqual(len(ports), 1, f"expected one pooled upstream connection, got {ports}")
 
     def test_daily_token_quota_is_enforced_before_forwarding(self) -> None:
         key, raw = self._new_key("quota", daily_token_limit=100)

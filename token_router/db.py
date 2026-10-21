@@ -217,10 +217,20 @@ class Database:
             try:
                 yield conn
             except BaseException:
-                conn.execute("ROLLBACK")
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
                 raise
             else:
-                conn.execute("COMMIT")
+                try:
+                    conn.execute("COMMIT")
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
 
     # --------------------------------------------------------------------- keys
     def create_key(

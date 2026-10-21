@@ -121,6 +121,27 @@ def build_parser() -> argparse.ArgumentParser:
     usage_parser.add_argument("--json", action="store_true", help="输出 JSON")
     usage_parser.set_defaults(func=cmd_usage)
 
+    price_parser = subparsers.add_parser("price", help="管理按模型的输入/输出/缓存价格")
+    price_sub = price_parser.add_subparsers(dest="price_command", required=True, metavar="操作")
+
+    price_set = price_sub.add_parser("set", help="设置全局或指定 key 的模型价格")
+    price_set.add_argument("--model", required=True, help="上游模型 ID")
+    price_set.add_argument("--input", required=True, help="输入价格 / 百万 token")
+    price_set.add_argument("--output", required=True, help="输出价格 / 百万 token")
+    price_set.add_argument("--cached", help="缓存命中输入价格 / 百万 token；省略则同输入价")
+    price_set.add_argument("--key", help="只对指定 key 生效（ID 或前缀）；省略为全局价")
+    price_set.set_defaults(func=cmd_price_set)
+
+    price_list = price_sub.add_parser("list", help="列出模型价格")
+    price_list.add_argument("--key", help="同时列出该 key 的覆盖价")
+    price_list.set_defaults(func=cmd_price_list)
+
+    price_remove = price_sub.add_parser("remove", help="删除模型价格")
+    price_remove.add_argument("--model", required=True, help="模型 ID")
+    price_remove.add_argument("--key", help="删除指定 key 的覆盖价；省略为全局价")
+    price_remove.add_argument("--yes", action="store_true", help="跳过确认")
+    price_remove.set_defaults(func=cmd_price_remove)
+
     requests_parser = subparsers.add_parser("requests", help="查看请求级账本")
     requests_parser.add_argument("--key", help="只显示指定 key（ID 或前缀）")
     requests_parser.add_argument("--limit", type=int, default=30, help="条数（默认 30，最大 1000）")
@@ -175,9 +196,14 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"数据库已就绪：{config.database_path}")
     print()
     print("下一步：")
-    print('  $env:TOKEN_ROUTER_UPSTREAM_KEY = "sk-..."   # 你的唯一上游 key')
-    print(f'  .\\run.cmd key create --name "my-app"')
-    print("  .\\run.cmd serve")
+    if os.name == "nt":
+        print('  $env:TOKEN_ROUTER_UPSTREAM_KEY = "sk-..."   # 你的唯一上游 key')
+        print('  .\\run.cmd key create --name "my-app"')
+        print("  .\\run.cmd serve")
+    else:
+        print('  export TOKEN_ROUTER_UPSTREAM_KEY="sk-..."   # 你的唯一上游 key')
+        print('  python3 -m token_router key create --name "my-app"')
+        print("  python3 -m token_router serve")
     print()
     print(f"下游统一接入地址：{_client_base_url(config)}/v1")
     return 0
@@ -237,7 +263,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"配置：      {config.config_path or '(内置默认值)'}")
     print(f"监听地址：  {_client_base_url(config)}")
     print(f"上游地址：  {config.base_url_description}")
-    print(f"上游 key：  {'已设置' if config.upstream_api_key else '未设置（serve 会拒绝启动）'}")
+    print(f"上游 key：  {'已设置' if config.upstream_api_key else '未在当前管理进程环境中设置（serve 会单独校验）'}")
     print(f"数据库：    {config.database_path}")
     print(f"计费时区：  UTC{_offset_text(config.timezone_offset_minutes)}")
     print(f"计费货币：  {config.currency}（{config.currency_symbol}）")
@@ -246,10 +272,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     print()
     print(f"今日（{format_timestamp(bounds.day_start, config.timezone_offset_minutes)} 起）")
     print(f"  tokens={format_int(totals_day.total_tokens)}  "
+          f"缓存命中={format_int(totals_day.cached_input_tokens)}  "
           f"费用={format_amount(totals_day.cost_micros, config.currency_symbol)}  "
           f"请求={totals_day.requests}")
     print(f"本月（{format_timestamp(bounds.month_start, config.timezone_offset_minutes)} 起）")
     print(f"  tokens={format_int(totals_month.total_tokens)}  "
+          f"缓存命中={format_int(totals_month.cached_input_tokens)}  "
           f"费用={format_amount(totals_month.cost_micros, config.currency_symbol)}  "
           f"请求={totals_month.requests}")
     return 0
@@ -292,6 +320,7 @@ def cmd_key_create(args: argparse.Namespace) -> int:
     print(f"前缀：      {key.key_prefix}")
     print(f"输入价格：  {format_price_per_mtok(key.price_in_micros_per_mtok, config.currency_symbol)}")
     print(f"输出价格：  {format_price_per_mtok(key.price_out_micros_per_mtok, config.currency_symbol)}")
+    print("缓存命中：  默认按输入价；可用 price set 为具体模型设置")
     print(f"每日限额：  {_limit_text(key.daily_token_limit)} tokens / {_cost_limit_text(key.daily_cost_limit_micros, config)}")
     print(f"每月限额：  {_limit_text(key.monthly_token_limit)} tokens / {_cost_limit_text(key.monthly_cost_limit_micros, config)}")
     print()
@@ -344,6 +373,9 @@ def cmd_key_show(args: argparse.Namespace) -> int:
     print(f"  最后使用：  {format_timestamp(key.last_used_at, config.timezone_offset_minutes)}")
     print(f"  输入价格：  {format_price_per_mtok(key.price_in_micros_per_mtok, config.currency_symbol)}")
     print(f"  输出价格：  {format_price_per_mtok(key.price_out_micros_per_mtok, config.currency_symbol)}")
+    print("  缓存命中：  默认按输入价")
+    overrides = db.list_model_prices(key_id=key.id, include_global=False)
+    print(f"  模型覆盖：  {len(overrides)} 条（price list --key {key.id}）")
     print(f"  备注：      {key.note or '-'}")
     print()
     _print_period_detail("今日", day, key.daily_token_limit, key.daily_cost_limit_micros, config, bounds.next_day)
@@ -434,6 +466,74 @@ def cmd_key_rotate(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------- price
+def cmd_price_set(args: argparse.Namespace) -> int:
+    config, db = _config_and_db(args)
+    key = db.resolve_key(args.key) if args.key else None
+    cached: int | None = None
+    if args.cached is not None and args.cached.strip().lower() not in {"same", "input", "none"}:
+        cached = parse_price_to_micros_per_mtok(args.cached)
+    price = db.set_model_price(
+        model=args.model,
+        input_micros_per_mtok=parse_price_to_micros_per_mtok(args.input),
+        output_micros_per_mtok=parse_price_to_micros_per_mtok(args.output),
+        cached_input_micros_per_mtok=cached,
+        key_id=key.id if key else None,
+    )
+    scope = f"key #{key.id}（{key.name}）" if key else "全局"
+    print(f"已设置 {scope} 模型价格：{price.model}")
+    print(f"  输入：      {format_price_per_mtok(price.input_micros_per_mtok, config.currency_symbol)}")
+    print(f"  输出：      {format_price_per_mtok(price.output_micros_per_mtok, config.currency_symbol)}")
+    print(
+        "  缓存命中：  "
+        + format_price_per_mtok(price.effective_cached_input_micros_per_mtok, config.currency_symbol)
+    )
+    return 0
+
+
+def cmd_price_list(args: argparse.Namespace) -> int:
+    config, db = _config_and_db(args)
+    key = db.resolve_key(args.key) if args.key else None
+    prices = db.list_model_prices(key_id=key.id if key else None, include_global=key is not None)
+    if not prices:
+        target = f"key #{key.id}" if key else "全局"
+        print(f"{target}还没有模型价格。使用 price set 添加。")
+        return 0
+    rows = []
+    for price in prices:
+        scope = "全局" if price.key_id is None else f"key #{price.key_id}" + (f"（{key.name}）" if key else "")
+        rows.append(
+            [
+                scope,
+                price.model,
+                format_price_per_mtok(price.input_micros_per_mtok, config.currency_symbol),
+                format_price_per_mtok(price.output_micros_per_mtok, config.currency_symbol),
+                format_price_per_mtok(price.effective_cached_input_micros_per_mtok, config.currency_symbol),
+                format_timestamp(price.updated_at, config.timezone_offset_minutes),
+            ]
+        )
+    print(
+        format_table(
+            ["范围", "模型", "输入价", "输出价", "缓存命中价", "更新时间"],
+            rows,
+        )
+    )
+    if key:
+        print("提示：key 覆盖价优先于全局价；未匹配任何模型价时回退到 key 默认输入/输出价。")
+    return 0
+
+
+def cmd_price_remove(args: argparse.Namespace) -> int:
+    _, db = _config_and_db(args)
+    key = db.resolve_key(args.key) if args.key else None
+    scope = f"key #{key.id}（{key.name}）" if key else "全局"
+    _confirm(args.yes, f"删除 {scope} 模型 {args.model!r} 的价格？ [y/N] ")
+    if not db.remove_model_price(args.model, key_id=key.id if key else None):
+        raise UserError("没有找到对应的模型价格")
+    print(f"已删除 {scope} 模型 {args.model!r} 的价格。")
+    return 0
+
+
 # -------------------------------------------------------------------------- usage
 def cmd_usage(args: argparse.Namespace) -> int:
     config, db = _config_and_db(args)
@@ -483,11 +583,13 @@ def cmd_usage(args: argparse.Namespace) -> int:
     day_total = _sum_totals(item.day for item in overview)
     month_total = _sum_totals(item.month for item in overview)
     print()
-    print(f"合计：今日 {format_int(day_total.total_tokens)} tokens / "
+    print(f"合计：今日 {format_int(day_total.total_tokens)} tokens（缓存命中 "
+          f"{format_int(day_total.cached_input_tokens)}） / "
           f"{format_amount(day_total.cost_micros, config.currency_symbol)}；"
-          f"本月 {format_int(month_total.total_tokens)} tokens / "
+          f"本月 {format_int(month_total.total_tokens)} tokens（缓存命中 "
+          f"{format_int(month_total.cached_input_tokens)}） / "
           f"{format_amount(month_total.cost_micros, config.currency_symbol)}")
-    print("提示：* 表示上游未返回 usage，金额和 token 为本地估算值。")
+    print("提示：* 表示上游未返回 usage，金额和 token 为本地估算值；缓存命中是输入 token 的子集。")
     return 0
 
 
@@ -503,6 +605,7 @@ def _usage_table(overview: list[KeyUsageOverview], period: str, config: Config) 
                 item.key.name,
                 totals.requests,
                 format_int(totals.total_tokens),
+                format_int(totals.cached_input_tokens),
                 format_amount(totals.cost_micros, config.currency_symbol),
                 _limit_text(token_limit),
                 _cost_limit_text(cost_limit, config),
@@ -515,6 +618,7 @@ def _usage_table(overview: list[KeyUsageOverview], period: str, config: Config) 
             "合计",
             sum(item.day.requests if period == "day" else item.month.requests for item in overview),
             format_int(sum((item.day if period == "day" else item.month).total_tokens for item in overview)),
+            format_int(sum((item.day if period == "day" else item.month).cached_input_tokens for item in overview)),
             format_amount(
                 sum((item.day if period == "day" else item.month).cost_micros for item in overview),
                 config.currency_symbol,
@@ -525,9 +629,9 @@ def _usage_table(overview: list[KeyUsageOverview], period: str, config: Config) 
         ]
     )
     return format_table(
-        ["ID", "名称", "请求", "Tokens", "费用", "Token限额", "费用限额", "剩余token"],
+        ["ID", "名称", "请求", "Tokens", "缓存", "费用", "Token限额", "费用限额", "剩余token"],
         rows,
-        numeric=[0, 2, 3, 4, 5, 6, 7],
+        numeric=[0, 2, 3, 4, 5, 6, 7, 8],
     )
 
 
@@ -551,6 +655,7 @@ def cmd_requests(args: argparse.Namespace) -> int:
                         "model": entry.model,
                         "status": entry.status,
                         "input_tokens": entry.input_tokens,
+                        "cached_input_tokens": entry.cached_input_tokens,
                         "output_tokens": entry.output_tokens,
                         "total_tokens": entry.total_tokens,
                         "cost_micros": entry.cost_micros,
@@ -575,6 +680,7 @@ def cmd_requests(args: argparse.Namespace) -> int:
             entry.key_name,
             entry.status,
             format_int(entry.input_tokens),
+            format_int(entry.cached_input_tokens),
             format_int(entry.output_tokens),
             format_amount(entry.cost_micros, config.currency_symbol),
             "*" if entry.estimated else "",
@@ -586,9 +692,9 @@ def cmd_requests(args: argparse.Namespace) -> int:
     ]
     print(
         format_table(
-            ["时间", "Key", "状态", "输入", "输出", "费用", "估算", "延迟ms", "端点", "请求ID"],
+            ["时间", "Key", "状态", "输入", "缓存", "输出", "费用", "估算", "延迟ms", "端点", "请求ID"],
             rows,
-            numeric=[2, 3, 4, 5, 7],
+            numeric=[2, 3, 4, 5, 6, 8],
         )
     )
     return 0
@@ -678,24 +784,27 @@ def _print_period_detail(
         f"{format_amount(totals.cost_micros, config.currency_symbol)} / "
         f"{_cost_limit_text(cost_limit, config)}"
     )
-    print(f"{label}：tokens {token_text}  费用 {cost_text}  请求 {totals.requests}")
+    print(f"{label}：tokens {token_text}  缓存命中 {format_int(totals.cached_input_tokens)}  "
+          f"费用 {cost_text}  请求 {totals.requests}")
     print(f"      重置时间 {format_timestamp(reset_at, config.timezone_offset_minutes)}")
 
 
 def _sum_totals(items: Any) -> UsageTotals:
-    input_tokens = output_tokens = requests = cost = 0
+    input_tokens = output_tokens = requests = cost = cached = 0
     for item in items:
         input_tokens += item.input_tokens
         output_tokens += item.output_tokens
         requests += item.requests
         cost += item.cost_micros
-    return UsageTotals(input_tokens, output_tokens, requests, cost)
+        cached += item.cached_input_tokens
+    return UsageTotals(input_tokens, output_tokens, requests, cost, cached)
 
 
 def _totals_json(totals: UsageTotals) -> dict[str, int]:
     return {
         "input_tokens": totals.input_tokens,
         "output_tokens": totals.output_tokens,
+        "cached_input_tokens": totals.cached_input_tokens,
         "total_tokens": totals.total_tokens,
         "requests": totals.requests,
         "cost_micros": totals.cost_micros,

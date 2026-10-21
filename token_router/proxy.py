@@ -748,13 +748,14 @@ class TokenRouterHandler(BaseHTTPRequestHandler):
             self.server.app.config.currency_symbol,
         )
         logger.info(
-            "request=%s key=%s endpoint=%s status=%s in=%d out=%d cost=%s est=%s "
+            "request=%s key=%s endpoint=%s status=%s in=%d cached=%d out=%d cost=%s est=%s "
             "latency_ms=%d ip=%s%s",
             getattr(self, "request_id", "-"),
             key,
             getattr(self, "_endpoint", "-"),
             status,
             usage.input_tokens,
+            usage.cached_input_tokens,
             usage.output_tokens,
             cost,
             usage.estimated,

@@ -88,10 +88,25 @@ def parse_price_to_micros_per_mtok(value: str) -> int:
     return parse_money_to_micros(value)
 
 
-def cost_micros(input_tokens: int, output_tokens: int, input_price: int, output_price: int) -> int:
-    """Cost in integer micro-units, rounded up so tiny calls are not free."""
+def cost_micros(
+    input_tokens: int,
+    output_tokens: int,
+    input_price: int,
+    output_price: int,
+    cached_input_tokens: int = 0,
+    cached_input_price: int | None = None,
+) -> int:
+    """Cost in integer micro-units, rounded up so tiny calls are not free.
 
-    numerator = input_tokens * input_price + output_tokens * output_price
+    ``input_tokens`` is the total prompt size. ``cached_input_tokens`` is the
+    subset charged at ``cached_input_price`` (falling back to ``input_price`` if
+    no cache price is configured).
+    """
+
+    cached = min(max(0, cached_input_tokens), max(0, input_tokens))
+    uncached = max(0, input_tokens - cached)
+    cache_price = input_price if cached_input_price is None else cached_input_price
+    numerator = uncached * input_price + cached * cache_price + output_tokens * output_price
     if numerator <= 0:
         return 0
     return (numerator + TOKENS_PER_MILLION - 1) // TOKENS_PER_MILLION

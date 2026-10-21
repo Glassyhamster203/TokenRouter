@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import Config
-from .db import ApiKey, Database
+from .db import ApiKey, Database, ResolvedPrice
 from .usage import (
     TokenUsage,
     is_billable_path,
@@ -36,6 +36,8 @@ class Reservation:
     output_tokens_reserved: int
     cost_micros_reserved: int
     metered: bool
+    price: ResolvedPrice
+    model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,20 +104,44 @@ class QuotaManager:
         timestamp = int(now if now is not None else time.time())
         bounds = period_bounds(timestamp, self.config.timezone_offset_minutes)
         metered = is_billable_path(path) and payload is not None
+        model = payload.get("model") if payload is not None else None
+        if isinstance(model, str):
+            stripped = model.strip()
+            model = stripped if 0 < len(stripped) <= 200 and "\n" not in stripped and "\r" not in stripped else None
+        else:
+            model = None
         if not metered:
-            return Reservation(key, bounds, timestamp, 0, 0, 0, False)
+            return Reservation(
+                key=key,
+                bounds=bounds,
+                admitted_at=timestamp,
+                input_tokens_estimate=0,
+                output_tokens_reserved=0,
+                cost_micros_reserved=0,
+                metered=False,
+                price=ResolvedPrice.from_key(key, model),
+                model=model,
+            )
 
         assert payload is not None
+        price = self.db.resolve_price(key, model)
         input_estimate = estimate_prompt_tokens(payload)
         output_reserve = 0 if is_embeddings_path(path) else requested_output_tokens(
             payload, path, self.config.default_max_output_tokens
         )
         token_reserve = input_estimate + output_reserve
+        # The cached-token share is unknown before the response. Reserve all
+        # prompt tokens at the higher of input/cache price so a cache price
+        # above the normal input price cannot bypass the cost quota.
+        reserved_input_price = max(
+            price.input_micros_per_mtok,
+            price.cached_input_micros_per_mtok,
+        )
         cost_reserve = cost_micros(
             input_estimate,
             output_reserve,
-            key.price_in_micros_per_mtok,
-            key.price_out_micros_per_mtok,
+            reserved_input_price,
+            price.output_micros_per_mtok,
         )
         has_limits = any(
             limit is not None
@@ -134,6 +160,8 @@ class QuotaManager:
             output_tokens_reserved=output_reserve,
             cost_micros_reserved=cost_reserve,
             metered=True,
+            price=price,
+            model=model,
         )
         if not has_limits:
             return reservation
@@ -208,8 +236,10 @@ class QuotaManager:
             effective_cost = cost_micros(
                 usage.input_tokens,
                 usage.output_tokens,
-                reservation.key.price_in_micros_per_mtok,
-                reservation.key.price_out_micros_per_mtok,
+                reservation.price.input_micros_per_mtok,
+                reservation.price.output_micros_per_mtok,
+                usage.cached_input_tokens,
+                reservation.price.cached_input_micros_per_mtok,
             )
         else:
             effective_usage = TokenUsage()

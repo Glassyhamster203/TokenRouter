@@ -95,6 +95,8 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
             return
         if model == "big":
             prompt_tokens, completion_tokens = 80, 10
+        elif model == "cached":
+            prompt_tokens, completion_tokens = 100, 10
         else:
             prompt_tokens, completion_tokens = 10, 5
 
@@ -149,6 +151,8 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
             }
+            if model == "cached":
+                response["usage"]["prompt_tokens_details"] = {"cached_tokens": 60}
         self._send_json(200, response)
 
 
@@ -441,6 +445,59 @@ class ProxyIntegrationTests(unittest.TestCase):
         logs = self.db.recent_requests(key_id=key.id)
         self.assertEqual(logs[0].status, 200)
         self.assertEqual(logs[0].total_tokens, 0)
+
+    def test_model_price_and_cached_tokens_are_billed(self) -> None:
+        key, raw = self._new_key("model-price")
+        self.db.set_model_price(
+            model="cached",
+            input_micros_per_mtok=2_000_000,
+            output_micros_per_mtok=10_000_000,
+            cached_input_micros_per_mtok=500_000,
+        )
+        status, _, body = self._request(
+            "POST",
+            "/v1/chat/completions",
+            raw,
+            {"model": "cached", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["usage"]["prompt_tokens_details"]["cached_tokens"], 60)
+        bounds = period_bounds(int(time.time()), 480)
+        day, _ = self.db.get_period_usage(key.id, bounds)
+        self.assertEqual(day.input_tokens, 100)
+        self.assertEqual(day.cached_input_tokens, 60)
+        self.assertEqual(day.output_tokens, 10)
+        # 40 uncached * 2 + 60 cached * 0.5 + 10 output * 10 = 210 micros
+        self.assertEqual(day.cost_micros, 210)
+        logs = self.db.recent_requests(key_id=key.id)
+        self.assertEqual(logs[0].cached_input_tokens, 60)
+        self.assertEqual(logs[0].cost_micros, 210)
+
+    def test_key_model_price_overrides_global(self) -> None:
+        key, raw = self._new_key("override")
+        self.db.set_model_price(
+            model="cached",
+            input_micros_per_mtok=2_000_000,
+            output_micros_per_mtok=10_000_000,
+            cached_input_micros_per_mtok=500_000,
+        )
+        self.db.set_model_price(
+            model="cached",
+            input_micros_per_mtok=4_000_000,
+            output_micros_per_mtok=20_000_000,
+            cached_input_micros_per_mtok=1_000_000,
+            key_id=key.id,
+        )
+        status, _, _ = self._request(
+            "POST",
+            "/v1/chat/completions",
+            raw,
+            {"model": "cached", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10},
+        )
+        self.assertEqual(status, 200)
+        day, _ = self.db.get_period_usage(key.id, period_bounds(int(time.time()), 480))
+        # 40 * 4 + 60 * 1 + 10 * 20 = 420 micros
+        self.assertEqual(day.cost_micros, 420)
 
     def test_unknown_endpoint_is_rejected(self) -> None:
         key, raw = self._new_key("unknown")

@@ -23,16 +23,22 @@ _MAX_SSE_CAPTURE_TEXT = 2 * 1024 * 1024
 class TokenUsage:
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_input_tokens: int = 0
     estimated: bool = False
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
+    @property
+    def uncached_input_tokens(self) -> int:
+        return max(0, self.input_tokens - self.cached_input_tokens)
+
     def as_dict(self) -> dict[str, int | bool]:
         return {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
             "total_tokens": self.total_tokens,
             "estimated": self.estimated,
         }
@@ -74,8 +80,35 @@ def _first_int(mapping: dict[str, Any], *keys: str) -> int | None:
     return None
 
 
+def _cached_input_tokens(usage: dict[str, Any]) -> int:
+    """Read cached-input counters from common OpenAI-compatible shapes."""
+
+    values: list[Any] = []
+    for detail_key in ("prompt_tokens_details", "input_tokens_details"):
+        details = usage.get(detail_key)
+        if isinstance(details, dict):
+            values.append(details.get("cached_tokens"))
+    values.extend(
+        usage.get(key)
+        for key in (
+            "cache_read_input_tokens",
+            "prompt_cache_hit_tokens",
+            "cached_tokens",
+        )
+    )
+    found = 0
+    for value in values:
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value >= 0:
+            found = max(found, value)
+        elif isinstance(value, float) and value >= 0 and value.is_integer():
+            found = max(found, int(value))
+    return found
+
+
 def extract_usage(value: Any) -> TokenUsage | None:
-    """Extract input/output token counts from an OpenAI-style object."""
+    """Extract input/output/cached-token counts from an OpenAI-style object."""
 
     if not isinstance(value, dict):
         return None
@@ -98,7 +131,8 @@ def extract_usage(value: Any) -> TokenUsage | None:
         completion = completion or 0
         if total is not None and prompt + completion == 0 and total > 0:
             prompt, completion = total, 0
-        return TokenUsage(prompt, completion, estimated=False)
+        cached = min(_cached_input_tokens(candidate), prompt)
+        return TokenUsage(prompt, completion, cached, estimated=False)
     return None
 
 

@@ -52,6 +52,12 @@ class UtilTests(unittest.TestCase):
         self.assertEqual(cost_micros(1_000_000, 0, 1_000_000, 0), 1_000_000)
         self.assertEqual(cost_micros(10, 5, 1_000_000, 2_000_000), 20)
         self.assertEqual(cost_micros(0, 0, 1_000_000, 2_000_000), 0)
+        self.assertEqual(
+            cost_micros(100, 10, 1_000_000, 2_000_000, 60, 500_000),
+            90,
+        )
+        self.assertEqual(cost_micros(100, 10, 1_000_000, 2_000_000, 60), 120)
+        self.assertEqual(cost_micros(10, 0, 1_000_000, 0, 99, 0), 0)
 
     def test_period_bounds_respect_fixed_offset(self) -> None:
         tz = timezone(timedelta(hours=8))
@@ -102,6 +108,39 @@ class UsageTests(unittest.TestCase):
         assert usage is not None
         self.assertEqual((usage.input_tokens, usage.output_tokens), (42, 0))
 
+    def test_extract_cached_tokens(self) -> None:
+        usage = extract_usage(
+            {
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 10,
+                    "prompt_tokens_details": {"cached_tokens": 60},
+                }
+            }
+        )
+        assert usage is not None
+        self.assertEqual((usage.input_tokens, usage.output_tokens, usage.cached_input_tokens), (100, 10, 60))
+        self.assertEqual(usage.uncached_input_tokens, 40)
+
+        deepseek = extract_usage(
+            {
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 10,
+                    "prompt_cache_hit_tokens": 70,
+                    "prompt_cache_miss_tokens": 30,
+                }
+            }
+        )
+        assert deepseek is not None
+        self.assertEqual(deepseek.cached_input_tokens, 70)
+
+        clamped = extract_usage(
+            {"usage": {"prompt_tokens": 5, "prompt_tokens_details": {"cached_tokens": 99}}}
+        )
+        assert clamped is not None
+        self.assertEqual(clamped.cached_input_tokens, 5)
+
     def test_inject_stream_usage(self) -> None:
         body = json.dumps(
             {
@@ -136,7 +175,8 @@ class UsageTests(unittest.TestCase):
         stream = (
             b'data: {"choices":[{"delta":{"content":"hello "}}]}\n\n'
             b'data: {"choices":[{"delta":{"content":"world"}}]}\n\n'
-            b'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":4}}\n\n'
+            b'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":4,'
+            b'"prompt_tokens_details":{"cached_tokens":6}}}\n\n'
             b"data: [DONE]\n\n"
         )
         extractor = SSEUsageExtractor()
@@ -145,7 +185,10 @@ class UsageTests(unittest.TestCase):
         extractor.finish()
         self.assertEqual(extractor.event_count, 3)
         assert extractor.usage is not None
-        self.assertEqual((extractor.usage.input_tokens, extractor.usage.output_tokens), (11, 4))
+        self.assertEqual(
+            (extractor.usage.input_tokens, extractor.usage.output_tokens, extractor.usage.cached_input_tokens),
+            (11, 4, 6),
+        )
         self.assertGreater(extractor.estimated_output_tokens, 0)
 
     def test_sse_extractor_responses_event(self) -> None:

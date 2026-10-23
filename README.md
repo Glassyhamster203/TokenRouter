@@ -314,6 +314,45 @@ sudo journalctl -u token-router -f
 - 默认只监听 `127.0.0.1`。绑定 `0.0.0.0` 前请在前面放 TLS 反向代理和防火墙，因为网关本身不终止 TLS。
 - 卸载：先备份数据，然后 `systemctl disable --now token-router`，删除服务单元、`/usr/local/bin/token-router-admin`、`/opt/token-router`，并按需删除 `/etc/token-router` 与 `/var/lib/token-router`。
 
+## 人民币日额度一键设置
+
+如果使用默认的人民币计费方案（3 个用户、每日 ¥60/¥60/¥20、全部模型、价格来自 [模型定价.md](模型定价.md)），可直接运行 [setup-linux-cny.sh](setup-linux-cny.sh)：
+
+```bash
+sudo ./setup-linux-cny.sh \
+  --upstream-base-url https://www.example.com/v1
+```
+
+脚本会：
+
+- 调用 `deploy.sh` 部署/升级 systemd 服务（`--no-key`）
+- 配置 `currency = CNY`、`currency_symbol = ¥`
+- 创建 `user-a:60`、`user-b:60`、`user-c:20` 三个用户，`allowed_models = ["*"]`
+- 从 `模型定价.md` 读取全部模型价格并用 `price set` 写入
+- 重启服务并做本地健康检查
+- 只打印本次新生成/轮换的下游 key
+
+常用参数：
+
+```bash
+# 自定义用户和每日人民币额度（可重复）
+sudo ./setup-linux-cny.sh --user team-a:100 --user team-b:50
+
+# 指定其他价格表
+sudo ./setup-linux-cny.sh --pricing-file /path/to/prices.md
+
+# 已部署，只同步用户和价格
+sudo ./setup-linux-cny.sh --skip-deploy
+
+# 重新生成三个 key（旧 key 失效）
+sudo ./setup-linux-cny.sh --rotate-keys
+
+# 只改配置，不立即重启（之后手动 systemctl restart token-router）
+sudo ./setup-linux-cny.sh --no-restart
+```
+
+脚本按用户名保留现有下游 key，因此重复执行不会无谓轮换；`--rotate-keys` 才会全部重新生成。上游 key 优先从 `TOKEN_ROUTER_UPSTREAM_KEY` 读取，否则在首次部署时交互输入，已有 EnvironmentFile 则保留。
+
 ## 支持的端点
 
 | 方法 | 路径 | 是否计费 | 说明 |
@@ -650,13 +689,16 @@ cost = ceil(
 TokenRouter/
 ├─ config.json               # 默认 JSON 配置
 ├─ config.example.toml       # 带 users 的 TOML 示例
+├─ 模型定价.md               # 人民币模型价目表（即可被 setup 脚本读取）
 ├─ run.cmd                   # Windows 下使用指定 Python 环境的启动器
 ├─ deploy.sh                 # Linux systemd 一键部署/升级脚本
+├─ setup-linux-cny.sh        # 人民币日额度部署/用户/价格一键设置
 ├─ token_router/
 │  ├─ __main__.py            # python -m token_router
 │  ├─ cli.py                 # init/serve/key/price/usage/requests/prune 等
 │  ├─ config.py              # JSON/TOML 加载、自动生成、用户配置、校验
 │  ├─ config_users.py        # 启动时把文件用户同步到 SQLite
+│  ├─ pricing.py             # 解析模型定价 Markdown
 │  ├─ db.py                  # SQLite schema、key、模型权限/价格、用量桶、账本
 │  ├─ quota.py               # 并发预占、配额检查、结算
 │  ├─ proxy.py               # 单端口 HTTP/SSE 代理、鉴权、模型权限
@@ -680,6 +722,7 @@ cd E:\TokenRouter
 - 模型价格全局/按 key 覆盖、价格优先级、缓存价计费；
 - JSON/TOML 文件配置、首次启动自动生成、用户同步；
 - 每 key 模型权限（精确/通配/禁止全部）；
+- 模型定价 Markdown 解析（含缓存命中价）；
 - SQLite v1/v2 → v3 自动迁移；
 - 无效 key、停用/吊销/轮换；
 - 多下游 key 共用一个上游 key；
